@@ -1,237 +1,104 @@
 from flask import Flask, request, jsonify
-import requests
-import re
+from flask_cors import CORS
 import json
-import urllib.parse
+import time
+from selenium import webdriver
+from selenium.webdriver.common.desired_capabilities import DesiredCapabilities
+from selenium.webdriver.chrome.options import Options
+from fake_useragent import UserAgent
 
 app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
 
-@app.route('/')
-def get_video():
+def extract_with_selenium(instagram_url):
+    """Launches a headless browser, loads the page, and captures video URLs from network logs."""
+    try:
+        # 1. Set up a realistic, rotating User-Agent
+        ua = UserAgent()
+        user_agent = ua.chrome  # or ua.random[citation:7]
+        
+        # 2. Configure Chrome to run headlessly and log network performance
+        capabilities = DesiredCapabilities.CHROME
+        capabilities["goog:loggingPrefs"] = {"performance": "ALL"}[citation:3][citation:8]
+        
+        chrome_options = Options()
+        chrome_options.add_argument("--headless=new")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--autoplay-policy=no-user-gesture-required")
+        chrome_options.add_argument(f"user-agent={user_agent}")[citation:7]
+        
+        # 3. Add a proxy (like AllOrigins) if needed. This is complex with Selenium.
+        #    You would typically route traffic through a proxy server, not a CORS proxy URL.
+        #    Example: chrome_options.add_argument('--proxy-server=http://your-proxy-server:port')
+        
+        # 4. Initialize the WebDriver with the above settings
+        driver = webdriver.Chrome(options=chrome_options, desired_capabilities=capabilities)
+        video_urls_found = []
+        
+        try:
+            # 5. Navigate to the Instagram embed page (or direct page)
+            # Convert the URL to an embed page if needed
+            if '/reel/' in instagram_url and not instagram_url.endswith('/embed/'):
+                target_url = instagram_url.rstrip('/') + '/embed/'
+            else:
+                target_url = instagram_url
+                
+            driver.get(target_url)
+            # Wait for page to load and video to start playing automatically
+            time.sleep(5)
+            
+            # 6. Get all network performance logs
+            logs = driver.get_log("performance")[citation:3][citation:8]
+            
+            # 7. Parse logs to find video file requests
+            for log_entry in logs:
+                log_data = json.loads(log_entry["message"])["message"]
+                
+                # Filter for network request/response events
+                if ("Network.request" in log_data["method"] or 
+                    "Network.response" in log_data["method"]):
+                    
+                    # Safely get the request URL
+                    request_info = log_data.get("params", {}).get("request", {})
+                    request_url = request_info.get("url", "")
+                    
+                    # Look for direct video file URLs (e.g., .mp4 from Facebook's CDN)
+                    if request_url and ('.mp4' in request_url or 'video_mp4' in request_url):
+                        # Filter out blob URLs and common non-video resources[citation:3]
+                        if not request_url.startswith('blob:') and 'fbcdn.net' in request_url:
+                            video_urls_found.append(request_url)
+                            
+        finally:
+            # 8. Always quit the driver to free resources
+            driver.quit()
+            
+        # Return the first (likely highest quality) video URL found
+        if video_urls_found:
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_urls = []
+            for url in video_urls_found:
+                if url not in seen:
+                    seen.add(url)
+                    unique_urls.append(url)
+            return {"status": "success", "url": unique_urls[0]}
+        else:
+            return {"status": "error", "message": "No video URL found in network traffic."}
+            
+    except Exception as e:
+        return {"status": "error", "message": f"Selenium automation failed: {str(e)}"}
+
+@app.route('/fetch', methods=['GET'])
+def fetch_reel():
+    """API endpoint to fetch an Instagram Reel's direct video URL."""
     url = request.args.get('url')
     
-    if not url or "instagram.com/reel/" not in url:
-        return jsonify({
-            "status": "error", 
-            "message": "Instagram Reel URL required"
-        }), 400
+    if not url or "instagram.com" not in url:
+        return jsonify({"status": "error", "message": "A valid Instagram URL is required."}), 400
     
-    try:
-        # METHOD 1: Try direct API call (Latest method)
-        reel_id = extract_reel_id(url)
-        if reel_id:
-            api_response = try_direct_api(reel_id)
-            if api_response:
-                return jsonify({
-                    "status": "success",
-                    "url": api_response,
-                    "method": "direct_api"
-                })
-        
-        # METHOD 2: Try embed page with new selectors
-        embed_response = try_embed_method(url)
-        if embed_response:
-            return jsonify({
-                "status": "success",
-                "url": embed_response,
-                "method": "embed_page"
-            })
-        
-        # METHOD 3: Try alternative services
-        alt_response = try_alternative_services(url)
-        if alt_response:
-            return jsonify({
-                "status": "success",
-                "url": alt_response,
-                "method": "alternative"
-            })
-        
-        return jsonify({
-            "status": "error",
-            "message": "Video not found. Instagram may have updated their API."
-        }), 404
-        
-    except Exception as e:
-        return jsonify({
-            "status": "error", 
-            "message": f"Server error: {str(e)}"
-        }), 500
-
-def extract_reel_id(url):
-    """Extract reel ID from URL"""
-    patterns = [
-        r'instagram\.com/reel/([^/?]+)',
-        r'instagram\.com/p/([^/?]+)'
-    ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
-    return None
-
-def try_direct_api(reel_id):
-    """Try Instagram's GraphQL API"""
-    try:
-        api_url = f"https://www.instagram.com/p/{reel_id}/?__a=1&__d=dis"
-        
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "application/json",
-            "Referer": "https://www.instagram.com/",
-            "X-Requested-With": "XMLHttpRequest"
-        }
-        
-        response = requests.get(api_url, headers=headers, timeout=10)
-        
-        if response.status_code == 200:
-            data = response.json()
-            
-            # Navigate through Instagram's JSON structure
-            if 'graphql' in data:
-                media = data['graphql']['shortcode_media']
-                if 'video_url' in media:
-                    return media['video_url']
-                elif 'video_versions' in media:
-                    return media['video_versions'][0]['url']
-            
-            # Alternative structure
-            if 'items' in data:
-                for item in data['items']:
-                    if 'video_versions' in item:
-                        return item['video_versions'][0]['url']
-                    
-    except Exception as e:
-        print(f"Direct API failed: {e}")
-    
-    return None
-
-def try_embed_method(url):
-    """Try embed page with updated selectors"""
-    try:
-        # Create embed URL
-        clean_url = url.split('?')[0].rstrip('/')
-        embed_url = f"{clean_url}/embed/captioned/"
-        
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://www.instagram.com/"
-        }
-        
-        response = requests.get(embed_url, headers=headers, timeout=10)
-        
-        if response.status_code == 200:
-            html = response.text
-            
-            # New patterns for 2024 Instagram
-            patterns = [
-                # JSON-LD data
-                r'"contentUrl":"([^"]+\.mp4[^"]*)"',
-                # Video source
-                r'source src="([^"]+\.mp4[^"]*)"',
-                # Video URL in meta
-                r'property="og:video" content="([^"]+)"',
-                # Instagram's new data structure
-                r'video_url":"([^"]+)"',
-                # Direct CDN URL
-                r'(https?://[^"\s]+\.(fbcdn|cdninstagram)\.(net|com)[^"\s]*\.mp4[^"\s]*)',
-                # Base64 encoded data
-                r'data-video="([^"]+)"',
-                # Instagram's GraphQL response in HTML
-                r'"video_versions":\[\{"url":"([^"]+)"',
-                # Additional patterns
-                r'"display_url":"([^"]+)"',
-                r'video src="([^"]+)"',
-                r'content="([^"]+\.mp4[^"]*)"'
-            ]
-            
-            for pattern in patterns:
-                matches = re.findall(pattern, html, re.IGNORECASE)
-                for match in matches:
-                    if isinstance(match, tuple):
-                        match = match[0]
-                    
-                    # Clean URL
-                    video_url = match.replace('\\/', '/').replace('\\u0026', '&')
-                    
-                    # Validate URL
-                    if video_url.startswith('http') and '.mp4' in video_url.lower():
-                        print(f"Found URL with pattern: {pattern[:30]}...")
-                        return video_url
-            
-            # Try to find JSON data in script tags
-            script_pattern = r'<script[^>]*>([^<]*)</script>'
-            scripts = re.findall(script_pattern, html, re.IGNORECASE)
-            
-            for script in scripts:
-                if 'video_versions' in script or 'video_url' in script:
-                    try:
-                        # Extract JSON-like data
-                        json_match = re.search(r'({.*})', script)
-                        if json_match:
-                            data = json.loads(json_match.group(1))
-                            
-                            # Try different JSON paths
-                            if 'video_url' in data:
-                                return data['video_url']
-                            elif 'video_versions' in data and len(data['video_versions']) > 0:
-                                return data['video_versions'][0]['url']
-                            elif 'graphql' in data:
-                                media = data['graphql']['shortcode_media']
-                                if 'video_url' in media:
-                                    return media['video_url']
-                                elif 'video_versions' in media:
-                                    return media['video_versions'][0]['url']
-                    except:
-                        continue
-        
-    except Exception as e:
-        print(f"Embed method failed: {e}")
-    
-    return None
-
-def try_alternative_services(url):
-    """Try third-party services as fallback"""
-    try:
-        services = [
-            {
-                'name': 'ddinstagram',
-                'url': f"https://www.ddinstagram.com/p/{extract_reel_id(url)}/",
-                'pattern': r'source src="([^"]+\.mp4[^"]*)"'
-            },
-            {
-                'name': 'instasupersave',
-                'api': 'https://instasupersave.com/api/ig/',
-                'method': 'POST'
-            }
-        ]
-        
-        for service in services:
-            try:
-                if service['name'] == 'ddinstagram':
-                    response = requests.get(service['url'], timeout=10)
-                    if response.status_code == 200:
-                        match = re.search(service['pattern'], response.text)
-                        if match:
-                            return match.group(1)
-                
-                elif service['name'] == 'instasupersave':
-                    data = {'url': url}
-                    response = requests.post(service['api'], json=data, timeout=10)
-                    if response.status_code == 200:
-                        data = response.json()
-                        if 'url' in data:
-                            return data['url']
-                            
-            except:
-                continue
-                
-    except Exception as e:
-        print(f"Alternative services failed: {e}")
-    
-    return None
+    result = extract_with_selenium(url)
+    return jsonify(result)
 
 if __name__ == '__main__':
     app.run(debug=True)
